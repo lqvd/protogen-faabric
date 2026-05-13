@@ -6,10 +6,10 @@
 
 using namespace google::protobuf;
 
-class GrannyGenerator : public compiler::CodeGenerator {
+class FaabricGenerator : public compiler::CodeGenerator {
  public:
-  GrannyGenerator() = default;
-  ~GrannyGenerator() override = default;
+  FaabricGenerator() = default;
+  ~FaabricGenerator() override = default;
 
   uint64_t GetSupportedFeatures() const override {
     return FEATURE_PROTO3_OPTIONAL;
