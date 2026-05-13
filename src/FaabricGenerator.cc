@@ -1,19 +1,21 @@
 #include "FaabricGenerator.h"
+
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/io/printer.h>
 #include <google/protobuf/io/zero_copy_stream.h>
+
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace google::protobuf;
 
-void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer);
-void GenerateServerService(const ServiceDescriptor* service, io::Printer& printer);
-void GenerateServerRegistration(const ServiceDescriptor* service, io::Printer& printer);
+namespace {
 
-static std::string toCppType(const Descriptor* d) {
+static std::string toCppType(const Descriptor* d)
+{
     std::string n = d->full_name();
     size_t pos = 0;
     while ((pos = n.find('.', pos)) != std::string::npos) {
@@ -23,101 +25,54 @@ static std::string toCppType(const Descriptor* d) {
     return "::" + n;
 }
 
-bool FaabricGenerator::Generate(const FileDescriptor* file,
-                               const std::string& parameter,
-                               compiler::GeneratorContext* context,
-                               std::string* error) const
+static std::vector<std::string> splitPackage(const std::string& package)
 {
-    (void)parameter;
-
-    if (file->service_count() == 0) return true;
-
-    std::string file_name(file->name());
-    std::string base_name = file_name.substr(0, file_name.find_last_of('.'));
-    std::string output_filename = base_name + ".faasm.h";
-
-    auto output_stream = std::unique_ptr<io::ZeroCopyOutputStream>(
-        context->Open(output_filename));
-    if (!output_stream) {
-        *error = "Failed to open output file " + output_filename;
-        return false;
-    }
-    io::Printer printer(output_stream.get(), '$');
-
-    printer.Print("#pragma once\n\n");
-    printer.Print("#include <cstdint>\n");
-    printer.Print("#include <vector>\n\n");
-    printer.Print("#include <faabric/rpc/RpcServer.h>\n");
-    printer.Print("#include <faasrpc/RpcCall.h>\n");
-    printer.Print("#include <faasprc/Task.h>\n");
-    printer.Print("#include <rpc.h>\n");
-    printer.Print("#include \"$base$.pb.h\"\n\n", "base", base_name);
-
-    // Dummy ServerContext to match gRPC API shape on the server side
-    printer.Print(
-        "namespace faabric::rpc {\n"
-        "  class ServerContext {};\n"
-        "} // namespace faabric::rpc\n\n"
-    );
-
-    std::string package = file->package();
     std::vector<std::string> parts;
-    if (!package.empty()) {
-        size_t start = 0, end = 0;
-        while ((end = package.find('.', start)) != std::string::npos) {
-            parts.push_back(package.substr(start, end - start));
-            start = end + 1;
-        }
-        parts.push_back(package.substr(start));
-        for (const auto& part : parts) {
-            printer.Print("namespace $part$ {\n", "part", part);
-        }
-        printer.Print("\n");
+
+    if (package.empty()) {
+        return parts;
     }
 
-    for (int i = 0; i < file->service_count(); ++i) {
-        const ServiceDescriptor* service = file->service(i);
-
-        printer.Print("class $name$ final {\n", "name", service->name());
-        printer.Print("public:\n");
-        printer.Indent();
-        GenerateClientStub(service, printer);
-        GenerateServerService(service, printer);
-        printer.Outdent();
-        printer.Print("private:\n");
-        printer.Indent();
-        printer.Print(
-            "$name$() = delete;\n"
-            "~$name$() = delete;\n"
-            "$name$(const $name$&) = delete;\n"
-            "$name$& operator=(const $name$&) = delete;\n",
-            "name", service->name());
-        printer.Outdent();
-        printer.Print("};\n\n");
-
-        GenerateServerRegistration(service, printer);
+    size_t start = 0;
+    size_t end = 0;
+    while ((end = package.find('.', start)) != std::string::npos) {
+        parts.push_back(package.substr(start, end - start));
+        start = end + 1;
     }
 
-    for (size_t i = 0; i < parts.size(); ++i) {
-        printer.Print("} // namespace\n");
-    }
+    parts.push_back(package.substr(start));
+    return parts;
+}
 
-    if (printer.failed()) {
-        *error = "FaabricGenerator failed to write to output file.";
+static bool hasSingleStringField(const Descriptor* d, std::string& fieldName)
+{
+    if (d->field_count() != 1) {
         return false;
     }
+
+    const FieldDescriptor* f = d->field(0);
+    if (f->type() != FieldDescriptor::TYPE_STRING) {
+        return false;
+    }
+
+    fieldName = f->name();
     return true;
 }
 
-void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer) {
+void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
+{
     printer.Print("class Stub final {\n");
     printer.Print("public:\n");
     printer.Indent();
+
     printer.Print("explicit Stub(int32_t channelId) : channelId_(channelId) {}\n\n");
 
     for (int i = 0; i < service->method_count(); ++i) {
         const MethodDescriptor* method = service->method(i);
-        if (method->client_streaming() || method->server_streaming()) continue;
+
+        if (method->client_streaming() || method->server_streaming()) {
+            continue;
+        }
 
         std::map<std::string, std::string> vars;
         vars["method_name"] = method->name();
@@ -125,62 +80,109 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer) 
         vars["req_type"] = toCppType(method->input_type());
         vars["res_type"] = toCppType(method->output_type());
 
-        // ----------------------------------------------------------------
-        // Sync: dispatch + await in one step.
-        // One migration point at the co_await RpcCall (inside wait_migratable).
-        // ----------------------------------------------------------------
-        printer.Print(vars,
+        printer.Print(
+            vars,
             "faabric::rpc::Task<$res_type$> $method_name$(const $req_type$& req) {\n");
         printer.Indent();
-        printer.Print(vars,
+        printer.Print(
+            vars,
             "std::vector<uint8_t> reqBuf(req.ByteSizeLong());\n"
-            "req.SerializeToArray(reqBuf.data(), static_cast<int>(reqBuf.size()));\n"
+            "req.SerializeToArray(reqBuf.data(), static_cast<int>(reqBuf.size()));\n\n"
             "int32_t requestId = 0;\n"
-            "__faasm_rpc_unary_start(\n"
+            "int32_t status = __faasm_rpc_unary_start(\n"
             "    channelId_,\n"
             "    \"$full_name$\",\n"
             "    reqBuf.data(),\n"
             "    static_cast<int32_t>(reqBuf.size()),\n"
             "    &requestId,\n"
-            "    -1);\n"
-            "co_return co_await faabric::coro::RpcCall<$res_type$>(requestId);\n");
+            "    -1);\n\n"
+            "(void)status;\n"
+            "co_return co_await faabric::rpc::RpcCall<$res_type$>(requestId);\n");
         printer.Outdent();
         printer.Print("}\n\n");
 
-        // ----------------------------------------------------------------
-        // Async: migration checkpoint BEFORE dispatch (migration point 1),
-        // then returns RpcCall. Migration point 2 fires when the caller
-        // co_awaits the returned RpcCall.
-        //
-        // Usage:
-        //   auto call_a = co_await stub.FooAsync(req_a);  // point 1
-        //   auto call_b = co_await stub.FooAsync(req_b);  // point 1
-        //   auto resp_a = co_await call_a;                // point 2
-        //   auto resp_b = co_await call_b;                // point 2
-        // ----------------------------------------------------------------
-        printer.Print(vars,
-            "faabric::rpc::Task<faabric::coro::RpcCall<$res_type$>> "
+        std::string singleStringField;
+        if (hasSingleStringField(method->input_type(), singleStringField)) {
+            vars["field_name"] = singleStringField;
+
+            printer.Print(
+                vars,
+                "faabric::rpc::Task<$res_type$> $method_name$(const std::string& message) {\n");
+            printer.Indent();
+            printer.Print(
+                vars,
+                "$req_type$ req;\n"
+                "req.set_$field_name$(message);\n"
+                "co_return co_await $method_name$(req);\n");
+            printer.Outdent();
+            printer.Print("}\n\n");
+
+            printer.Print(
+                vars,
+                "faabric::rpc::Task<$res_type$> $method_name$(const char* message) {\n");
+            printer.Indent();
+            printer.Print(
+                vars,
+                "$req_type$ req;\n"
+                "req.set_$field_name$(message);\n"
+                "co_return co_await $method_name$(req);\n");
+            printer.Outdent();
+            printer.Print("}\n\n");
+        }
+
+        printer.Print(
+            vars,
+            "faabric::rpc::Task<faabric::rpc::RpcCall<$res_type$>> "
             "$method_name$Async(const $req_type$& req) {\n");
         printer.Indent();
         printer.Print(
-            "// Migration point 1: migrate before dispatching if needed.\n"
-            "// Ensures the request is sent from the correct host.\n"
-            "co_await faabric::coro::MigrationCheckpoint{};\n\n");
-        printer.Print(vars,
+            "co_await faabric::rpc::MigrationCheckpoint{};\n\n");
+        printer.Print(
+            vars,
             "std::vector<uint8_t> reqBuf(req.ByteSizeLong());\n"
-            "req.SerializeToArray(reqBuf.data(), static_cast<int>(reqBuf.size()));\n"
+            "req.SerializeToArray(reqBuf.data(), static_cast<int>(reqBuf.size()));\n\n"
             "int32_t requestId = 0;\n"
-            "__faasm_rpc_unary_start(\n"
+            "int32_t status = __faasm_rpc_unary_start(\n"
             "    channelId_,\n"
             "    \"$full_name$\",\n"
             "    reqBuf.data(),\n"
             "    static_cast<int32_t>(reqBuf.size()),\n"
             "    &requestId,\n"
-            "    -1);\n"
-            "// Migration point 2 fires when the caller co_awaits the returned RpcCall.\n"
-            "co_return faabric::coro::RpcCall<$res_type$>(requestId);\n");
+            "    -1);\n\n"
+            "(void)status;\n"
+            "co_return faabric::rpc::RpcCall<$res_type$>(requestId);\n");
         printer.Outdent();
         printer.Print("}\n\n");
+
+        if (hasSingleStringField(method->input_type(), singleStringField)) {
+            vars["field_name"] = singleStringField;
+
+            printer.Print(
+                vars,
+                "faabric::rpc::Task<faabric::rpc::RpcCall<$res_type$>> "
+                "$method_name$Async(const std::string& message) {\n");
+            printer.Indent();
+            printer.Print(
+                vars,
+                "$req_type$ req;\n"
+                "req.set_$field_name$(message);\n"
+                "co_return co_await $method_name$Async(req);\n");
+            printer.Outdent();
+            printer.Print("}\n\n");
+
+            printer.Print(
+                vars,
+                "faabric::rpc::Task<faabric::rpc::RpcCall<$res_type$>> "
+                "$method_name$Async(const char* message) {\n");
+            printer.Indent();
+            printer.Print(
+                vars,
+                "$req_type$ req;\n"
+                "req.set_$field_name$(message);\n"
+                "co_return co_await $method_name$Async(req);\n");
+            printer.Outdent();
+            printer.Print("}\n\n");
+        }
     }
 
     printer.Outdent();
@@ -196,77 +198,182 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer) 
         "}\n\n");
 }
 
-void GenerateServerService(const ServiceDescriptor* service, io::Printer& printer) {
-    printer.Print("class Service {\n");
+void GenerateServerService(const ServiceDescriptor* service, io::Printer& printer)
+{
+    printer.Print("class Service : public faabric::rpc::Service {\n");
     printer.Print("public:\n");
     printer.Indent();
-    printer.Print("virtual ~Service() = default;\n\n");
+
+    printer.Print("Service() {\n");
+    printer.Indent();
 
     for (int i = 0; i < service->method_count(); ++i) {
         const MethodDescriptor* method = service->method(i);
-        if (method->client_streaming() || method->server_streaming()) continue;
+
+        if (method->client_streaming() || method->server_streaming()) {
+            continue;
+        }
+
+        std::map<std::string, std::string> vars;
+        vars["full_name"] = "/" + service->full_name() + "/" + method->name();
+
+        printer.Print(vars, "AddMethod(\"$full_name$\");\n");
+    }
+
+    printer.Outdent();
+    printer.Print("}\n\n");
+
+    for (int i = 0; i < service->method_count(); ++i) {
+        const MethodDescriptor* method = service->method(i);
+
+        if (method->client_streaming() || method->server_streaming()) {
+            continue;
+        }
 
         std::map<std::string, std::string> vars;
         vars["method_name"] = method->name();
         vars["req_type"] = toCppType(method->input_type());
         vars["res_type"] = toCppType(method->output_type());
-
-        // Server handlers stay synchronous — they run in the RpcServer's
-        // thread pool and don't need coroutine semantics.
-        // Matches grpc::Status Method(ServerContext*, const Req*, Res*)
-        printer.Print(vars,
-            "virtual faabric::rpc::Status $method_name$(\n"
-            "    faabric::rpc::ServerContext* ctx,\n"
-            "    const $req_type$* req,\n"
-            "    $res_type$* res) = 0;\n");
     }
 
-    printer.Outdent();
-    printer.Print("}; // class Service\n\n");
-}
-
-void GenerateServerRegistration(const ServiceDescriptor* service, io::Printer& printer) {
-    std::map<std::string, std::string> vars;
-    vars["service_name"] = service->name();
-
-    printer.Print(vars,
-        "inline void register$service_name$Service(\n"
-        "    faabric::rpc::RpcServer& server,\n"
-        "    std::shared_ptr<$service_name$::Service> service) {\n");
+    printer.Print(
+        "Rpc_Status HandleCall(const std::string& method,\n"
+        "                      const uint8_t* reqData,\n"
+        "                      size_t reqLen,\n"
+        "                      std::vector<uint8_t>& respData) override {\n");
     printer.Indent();
 
     for (int i = 0; i < service->method_count(); ++i) {
         const MethodDescriptor* method = service->method(i);
-        if (method->client_streaming() || method->server_streaming()) continue;
 
+        if (method->client_streaming() || method->server_streaming()) {
+            continue;
+        }
+
+        std::map<std::string, std::string> vars;
         vars["method_name"] = method->name();
         vars["full_name"] = "/" + service->full_name() + "/" + method->name();
         vars["req_type"] = toCppType(method->input_type());
         vars["res_type"] = toCppType(method->output_type());
 
-        printer.Print(vars,
-            "server.registerHandler(\"$full_name$\",\n"
-            "    [service](const uint8_t* reqData, size_t reqLen,\n"
-            "              std::vector<uint8_t>& resData) -> faabric::rpc::Status {\n"
+        printer.Print(
+            vars,
+            "if (method == \"$full_name$\") {\n"
             "  $req_type$ req;\n"
             "  if (!req.ParseFromArray(reqData, static_cast<int>(reqLen))) {\n"
-            "    return {faabric::rpc::StatusCode::INTERNAL,\n"
-            "            \"Request deserialisation failed\"};\n"
+            "    return {Rpc_StatusCode::INTERNAL, \"Deserialisation failed\"};\n"
             "  }\n\n"
             "  $res_type$ res;\n"
             "  faabric::rpc::ServerContext ctx;\n"
-            "  faabric::rpc::Status status = service->$method_name$(&ctx, &req, &res);\n"
-            "  if (!status.ok()) return status;\n\n"
-            "  resData.resize(res.ByteSizeLong());\n"
-            "  if (!res.SerializeToArray(resData.data(),\n"
-            "                            static_cast<int>(resData.size()))) {\n"
-            "    return {faabric::rpc::StatusCode::INTERNAL,\n"
-            "            \"Response serialisation failed\"};\n"
-            "  }\n"
+            "  Rpc_Status status = $method_name$(&ctx, &req, &res);\n"
+            "  if (!status.ok()) {\n"
+            "    return status;\n"
+            "  }\n\n"
+            "  respData.resize(res.ByteSizeLong());\n"
+            "  res.SerializeToArray(respData.data(),\n"
+            "                       static_cast<int>(respData.size()));\n"
             "  return status;\n"
-            "});\n");
+            "}\n");
     }
 
+    printer.Print(
+        "return {Rpc_StatusCode::NOT_FOUND, \"Unknown method: \" + method};\n");
+
     printer.Outdent();
-    printer.Print("}\n\n");
+    printer.Print("}\n");
+
+    printer.Outdent();
+    printer.Print("}; // class Service\n\n");
+}
+
+} // namespace
+
+bool FaabricGenerator::Generate(const FileDescriptor* file,
+                                const std::string& parameter,
+                                compiler::GeneratorContext* context,
+                                std::string* error) const
+{
+    (void)parameter;
+
+    if (file->service_count() == 0) {
+        return true;
+    }
+
+    std::string fileName(file->name());
+    std::string baseName = fileName.substr(0, fileName.find_last_of('.'));
+    std::string outputFilename = baseName + ".faabric.h";
+
+    auto outputStream = std::unique_ptr<io::ZeroCopyOutputStream>(
+        context->Open(outputFilename));
+
+    if (!outputStream) {
+        *error = "Failed to open output file " + outputFilename;
+        return false;
+    }
+
+    io::Printer printer(outputStream.get(), '$');
+
+    printer.Print("// Generated by the protocol buffer compiler. DO NOT EDIT!\n");
+    printer.Print("// source: $name$\n\n", "name", file->name());
+
+    printer.Print("#pragma once\n\n");
+
+    printer.Print("#include <cstddef>\n");
+    printer.Print("#include <cstdint>\n");
+    printer.Print("#include <memory>\n");
+    printer.Print("#include <string>\n");
+    printer.Print("#include <vector>\n\n");
+
+    printer.Print("#include <faasrpc/MigrationCheckpoint.h>\n");
+    printer.Print("#include <faasrpc/RpcCall.h>\n");
+    printer.Print("#include <faasrpc/Task.h>\n");
+    printer.Print("#include <rpc.h>\n\n");
+
+    printer.Print("#include \"$base$.pb.h\"\n\n", "base", baseName);
+
+    std::vector<std::string> namespaceParts = splitPackage(file->package());
+
+    for (const auto& part : namespaceParts) {
+        printer.Print("namespace $part$ {\n", "part", part);
+    }
+
+    if (!namespaceParts.empty()) {
+        printer.Print("\n");
+    }
+
+    for (int i = 0; i < file->service_count(); ++i) {
+        const ServiceDescriptor* service = file->service(i);
+
+        printer.Print("class $name$ final {\n", "name", service->name());
+        printer.Print("public:\n");
+        printer.Indent();
+
+        GenerateClientStub(service, printer);
+        GenerateServerService(service, printer);
+
+        printer.Outdent();
+        printer.Print("private:\n");
+        printer.Indent();
+
+        printer.Print(
+            "$name$() = delete;\n"
+            "~$name$() = delete;\n"
+            "$name$(const $name$&) = delete;\n"
+            "$name$& operator=(const $name$&) = delete;\n",
+            "name", service->name());
+
+        printer.Outdent();
+        printer.Print("};\n\n");
+    }
+
+    for (auto it = namespaceParts.rbegin(); it != namespaceParts.rend(); ++it) {
+        printer.Print("} // namespace $part$\n", "part", *it);
+    }
+
+    if (printer.failed()) {
+        *error = "FaabricGenerator failed to write to output file.";
+        return false;
+    }
+
+    return true;
 }
