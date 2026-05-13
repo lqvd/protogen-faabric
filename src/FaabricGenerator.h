@@ -1,5 +1,5 @@
-#ifndef GRANNY_GENERATOR_H_
-#define GRANNY_GENERATOR_H_
+#ifndef FAABRIC_GENERATOR_H_
+#define FAABRIC_GENERATOR_H_
 
 #include <google/protobuf/compiler/code_generator.h>
 #include <string>
@@ -20,4 +20,4 @@ class GrannyGenerator : public compiler::CodeGenerator {
                 std::string* error) const override;
 };
 
-#endif  // GRANNY_GENERATOR_H_
+#endif  // FAABRIC_GENERATOR_H_

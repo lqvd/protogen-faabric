@@ -1,4 +1,4 @@
-#include "GrannyGenerator.h"
+#include "FaabricGenerator.h"
 #include <google/protobuf/compiler/plugin.h>
 
 // Call point for Granny code generator
