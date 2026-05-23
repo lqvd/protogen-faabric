@@ -219,7 +219,7 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
     printer.Print("}\n\n");
 
     // Declare the virtual methods the user implements.
-    // Each returns Task<Rpc_Status> so handlers can suspend at co_await
+    // Each returns Task<faabric::rpc::Status> so handlers can suspend at co_await
     // (e.g. when making downstream RPC calls).
     for (int i = 0; i < service->method_count(); ++i) {
         const MethodDescriptor* method = service->method(i);
@@ -234,14 +234,14 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
 
         printer.Print(
             vars,
-            "virtual faabric::rpc::Task<Rpc_Status> $method_name$(\n"
+            "virtual faabric::rpc::Task<faabric::rpc::Status> $method_name$(\n"
             "    faabric::rpc::ServerContext* ctx,\n"
             "    const $req_type$* req,\n"
             "    $res_type$* res) = 0;\n\n");
     }
 
     printer.Print(
-        "faabric::rpc::Task<Rpc_Status> HandleCall(\n"
+        "faabric::rpc::Task<faabric::rpc::Status> HandleCall(\n"
         "    const std::string& method,\n"
         "    const uint8_t* reqData,\n"
         "    size_t reqLen,\n"
@@ -265,12 +265,12 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
             "if (method == \"$full_name$\") {\n"
             "  $req_type$ req;\n"
             "  if (!req.ParseFromArray(reqData, static_cast<int>(reqLen))) {\n"
-            "    co_return Rpc_Status{Rpc_StatusCode::INTERNAL,\n"
+            "    co_return faabric::rpc::Status{Rpc_StatusCode::INTERNAL,\n"
             "                         \"Deserialisation failed\"};\n"
             "  }\n\n"
             "  $res_type$ res;\n"
             "  faabric::rpc::ServerContext ctx;\n"
-            "  Rpc_Status status = co_await $method_name$(&ctx, &req, &res);\n"
+            "  faabric::rpc::Status status = co_await $method_name$(&ctx, &req, &res);\n"
             "  if (!status.ok()) {\n"
             "    co_return status;\n"
             "  }\n\n"
@@ -282,7 +282,7 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
     }
 
     printer.Print(
-        "co_return Rpc_Status{Rpc_StatusCode::NOT_FOUND,\n"
+        "co_return faabric::rpc::Status{Rpc_StatusCode::NOT_FOUND,\n"
         "                     \"Unknown method: \" + method};\n");
 
     printer.Outdent();
@@ -325,7 +325,8 @@ bool FaabricGenerator::Generate(const FileDescriptor* file,
     printer.Print("#pragma once\n\n");
     
     printer.Print("#include <faasrpc/RpcCall.h>\n");
-    printer.Print("#include <faasrpc/Service.h>");
+    printer.Print("#include <faasrpc/Service.h>\n");
+    printer.Print("#include <faasrpc/Server.h>\n");
     printer.Print("#include <faasrpc/Task.h>\n");
     printer.Print("#include <rpc.h>\n\n");
 
