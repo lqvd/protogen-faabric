@@ -4,7 +4,6 @@
 #include <google/protobuf/io/printer.h>
 #include <google/protobuf/io/zero_copy_stream.h>
 
-#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -44,19 +43,15 @@ static std::vector<std::string> splitPackage(const std::string& package)
     return parts;
 }
 
-static bool hasSingleStringField(const Descriptor* d, std::string& fieldName)
+static std::string getServiceUri(const ServiceDescriptor* service)
 {
-    if (d->field_count() != 1) {
-        return false;
+    const FileDescriptor* file = service->file();
+
+    if (file->package().empty()) {
+        return "faabric://" + service->name();
     }
 
-    const FieldDescriptor* f = d->field(0);
-    if (f->type() != FieldDescriptor::TYPE_STRING) {
-        return false;
-    }
-
-    fieldName = f->name();
-    return true;
+    return "faabric://" + file->package() + "/" + service->name();
 }
 
 void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
@@ -65,7 +60,14 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
     printer.Print("public:\n");
     printer.Indent();
 
-    printer.Print("explicit Stub(int32_t channelId) : channelId_(channelId) {}\n\n");
+    printer.Print(
+        "explicit Stub(std::shared_ptr<faabric::rpc::Channel> channel)\n"
+        "  : channel_(std::move(channel))\n"
+        "{\n"
+        "  if (!channel_ || !channel_->valid()) {\n"
+        "    throw std::runtime_error(\"Invalid RPC channel\");\n"
+        "  }\n"
+        "}\n\n");
 
     for (int i = 0; i < service->method_count(); ++i) {
         const MethodDescriptor* method = service->method(i);
@@ -82,117 +84,86 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
 
         printer.Print(
             vars,
-            "faabric::rpc::Task<$res_type$> $method_name$(const $req_type$& req) {\n");
+            "faabric::rpc::Task<faabric::rpc::StatusOr<$res_type$>> "
+            "$method_name$(\n"
+            "    faabric::rpc::ClientContext* ctx,\n"
+            "    const $req_type$& req) {\n");
         printer.Indent();
-        printer.Print(
-            vars,
-            "std::vector<uint8_t> reqBuf(req.ByteSizeLong());\n"
-            "req.SerializeToArray(reqBuf.data(), static_cast<int>(reqBuf.size()));\n\n"
-            "int32_t requestId = 0;\n"
-            "int32_t status = __faasm_rpc_unary_start(\n"
-            "    channelId_,\n"
-            "    \"$full_name$\",\n"
-            "    reqBuf.data(),\n"
-            "    static_cast<int32_t>(reqBuf.size()),\n"
-            "    &requestId,\n"
-            "    -1);\n\n"
-            "(void)status;\n"
-            "co_return co_await faabric::rpc::RpcCall<$res_type$>(requestId);\n");
+        printer.Print(vars, "co_return co_await $method_name$Async(ctx, req);\n");
         printer.Outdent();
         printer.Print("}\n\n");
 
-        std::string singleStringField;
-        if (hasSingleStringField(method->input_type(), singleStringField)) {
-            vars["field_name"] = singleStringField;
-
-            printer.Print(
-                vars,
-                "faabric::rpc::Task<$res_type$> $method_name$(const std::string& message) {\n");
-            printer.Indent();
-            printer.Print(
-                vars,
-                "$req_type$ req;\n"
-                "req.set_$field_name$(message);\n"
-                "co_return co_await $method_name$(req);\n");
-            printer.Outdent();
-            printer.Print("}\n\n");
-
-            printer.Print(
-                vars,
-                "faabric::rpc::Task<$res_type$> $method_name$(const char* message) {\n");
-            printer.Indent();
-            printer.Print(
-                vars,
-                "$req_type$ req;\n"
-                "req.set_$field_name$(message);\n"
-                "co_return co_await $method_name$(req);\n");
-            printer.Outdent();
-            printer.Print("}\n\n");
-        }
-
         printer.Print(
             vars,
-            "faabric::rpc::RpcCall<$res_type$> "
-            "$method_name$Async(const $req_type$& req) {\n");
+            "faabric::rpc::RpcCall<$res_type$> $method_name$Async(\n"
+            "    faabric::rpc::ClientContext* ctx,\n"
+            "    const $req_type$& req) {\n");
         printer.Indent();
+
         printer.Print(
             vars,
+            "if (ctx == nullptr) {\n"
+            "  return faabric::rpc::RpcCall<$res_type$>::Failed(\n"
+            "      faabric::rpc::Status{\n"
+            "          Rpc_StatusCode::INVALID_ARGUMENT,\n"
+            "          \"Null ClientContext passed to $method_name$Async\"});\n"
+            "}\n\n"
             "std::vector<uint8_t> reqBuf(req.ByteSizeLong());\n"
-            "req.SerializeToArray(reqBuf.data(), static_cast<int>(reqBuf.size()));\n\n"
-            "int32_t requestId = 0;\n"
-            "int32_t status = __faasm_rpc_unary_start(\n"
-            "    channelId_,\n"
+            "if (!req.SerializeToArray(reqBuf.data(),\n"
+            "                          static_cast<int>(reqBuf.size()))) {\n"
+            "  return faabric::rpc::RpcCall<$res_type$>::Failed(\n"
+            "      faabric::rpc::Status{\n"
+            "          Rpc_StatusCode::INTERNAL,\n"
+            "          \"Failed to serialise RPC request: $full_name$\"});\n"
+            "}\n\n"
+            "uint32_t requestId = 0;\n"
+            "int32_t statusCode = __faasm_rpc_unary_start(\n"
+            "    channel_->id(),\n"
             "    \"$full_name$\",\n"
-            "    reqBuf.data(),\n"
+            "    reqBuf.empty() ? nullptr : reqBuf.data(),\n"
             "    static_cast<int32_t>(reqBuf.size()),\n"
             "    &requestId,\n"
-            "    -1);\n\n"
-            "(void)status;\n"
+            "    ctx->getTimeoutMs());\n\n"
+            "if (statusCode != Rpc_StatusCode::OK) {\n"
+            "  return faabric::rpc::RpcCall<$res_type$>::Failed(\n"
+            "      faabric::rpc::Status{\n"
+            "          statusCode,\n"
+            "          \"Failed to start RPC: $full_name$\"});\n"
+            "}\n\n"
             "return faabric::rpc::RpcCall<$res_type$>(requestId);\n");
+
         printer.Outdent();
         printer.Print("}\n\n");
-
-        if (hasSingleStringField(method->input_type(), singleStringField)) {
-            vars["field_name"] = singleStringField;
-
-            printer.Print(
-                vars,
-                "faabric::rpc::RpcCall<$res_type$> "
-                "$method_name$Async(const std::string& message) {\n");
-            printer.Indent();
-            printer.Print(
-                vars,
-                "$req_type$ req;\n"
-                "req.set_$field_name$(message);\n"
-                "return $method_name$Async(req);\n");
-            printer.Outdent();
-            printer.Print("}\n\n");
-
-            printer.Print(
-                vars,
-                "faabric::rpc::RpcCall<$res_type$> "
-                "$method_name$Async(const char* message) {\n");
-            printer.Indent();
-            printer.Print(
-                vars,
-                "$req_type$ req;\n"
-                "req.set_$field_name$(message);\n"
-                "return $method_name$Async(req);\n");
-            printer.Outdent();
-            printer.Print("}\n\n");
-        }
     }
 
     printer.Outdent();
     printer.Print("private:\n");
     printer.Indent();
-    printer.Print("int32_t channelId_;\n");
+    printer.Print("std::shared_ptr<faabric::rpc::Channel> channel_;\n");
     printer.Outdent();
     printer.Print("}; // class Stub\n\n");
 
     printer.Print(
-        "static std::unique_ptr<Stub> NewStub(int32_t channelId) {\n"
-        "  return std::make_unique<Stub>(channelId);\n"
+        "static std::unique_ptr<Stub> NewStub(\n"
+        "    std::shared_ptr<faabric::rpc::Channel> channel) {\n"
+        "  return std::make_unique<Stub>(std::move(channel));\n"
+        "}\n\n");
+
+    printer.Print(
+        "static faabric::rpc::Status NewStub(std::unique_ptr<Stub>* out) {\n"
+        "  if (out == nullptr) {\n"
+        "    return faabric::rpc::Status{\n"
+        "        Rpc_StatusCode::INVALID_ARGUMENT,\n"
+        "        \"Null output pointer passed to NewStub\"};\n"
+        "  }\n\n"
+        "  std::shared_ptr<faabric::rpc::Channel> channel;\n"
+        "  faabric::rpc::Status status =\n"
+        "      faabric::rpc::CreateChannel(ServiceUri, &channel);\n"
+        "  if (!status.ok()) {\n"
+        "    return status;\n"
+        "  }\n\n"
+        "  *out = std::make_unique<Stub>(std::move(channel));\n"
+        "  return faabric::rpc::Status::OK();\n"
         "}\n\n");
 }
 
@@ -210,8 +181,10 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
         if (method->client_streaming() || method->server_streaming()) {
             continue;
         }
+
         std::map<std::string, std::string> vars;
         vars["full_name"] = "/" + service->full_name() + "/" + method->name();
+
         printer.Print(vars, "AddMethod(\"$full_name$\");\n");
     }
 
@@ -265,8 +238,9 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
             "if (method == \"$full_name$\") {\n"
             "  $req_type$ req;\n"
             "  if (!req.ParseFromArray(reqData, static_cast<int>(reqLen))) {\n"
-            "    co_return faabric::rpc::Status{Rpc_StatusCode::INTERNAL,\n"
-            "                         \"Deserialisation failed\"};\n"
+            "    co_return faabric::rpc::Status{\n"
+            "        Rpc_StatusCode::INTERNAL,\n"
+            "        \"Deserialisation failed\"};\n"
             "  }\n\n"
             "  $res_type$ res;\n"
             "  faabric::rpc::ServerContext ctx;\n"
@@ -275,15 +249,20 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
             "    co_return status;\n"
             "  }\n\n"
             "  respData.resize(res.ByteSizeLong());\n"
-            "  res.SerializeToArray(respData.data(),\n"
-            "                       static_cast<int>(respData.size()));\n"
-            "  co_return status;\n"
+            "  if (!res.SerializeToArray(respData.data(),\n"
+            "                            static_cast<int>(respData.size()))) {\n"
+            "    co_return faabric::rpc::Status{\n"
+            "        Rpc_StatusCode::INTERNAL,\n"
+            "        \"Serialisation failed\"};\n"
+            "  }\n\n"
+            "  co_return faabric::rpc::Status::OK();\n"
             "}\n");
     }
 
     printer.Print(
-        "co_return faabric::rpc::Status{Rpc_StatusCode::NOT_FOUND,\n"
-        "                     \"Unknown method: \" + method};\n");
+        "co_return faabric::rpc::Status{\n"
+        "    Rpc_StatusCode::UNIMPLEMENTED,\n"
+        "    \"Unknown method: \" + method};\n");
 
     printer.Outdent();
     printer.Print("}\n");
@@ -323,17 +302,23 @@ bool FaabricGenerator::Generate(const FileDescriptor* file,
     printer.Print("// source: $name$\n\n", "name", file->name());
 
     printer.Print("#pragma once\n\n");
-    
+
+    printer.Print("#include <faabric/rpc/rpc.h>\n");
+    printer.Print("#include <faasrpc/Channel.h>\n");
+    printer.Print("#include <faasrpc/ClientContext.h>\n");
     printer.Print("#include <faasrpc/RpcCall.h>\n");
     printer.Print("#include <faasrpc/Service.h>\n");
     printer.Print("#include <faasrpc/Server.h>\n");
-    printer.Print("#include <faasrpc/Task.h>\n");
-    printer.Print("#include <rpc.h>\n\n");
+    printer.Print("#include <faasrpc/Status.h>\n");
+    printer.Print("#include <faasrpc/Task.h>\n\n");
 
     printer.Print("#include <cstddef>\n");
     printer.Print("#include <cstdint>\n");
     printer.Print("#include <memory>\n");
+    printer.Print("#include <stdexcept>\n");
     printer.Print("#include <string>\n");
+    printer.Print("#include <string_view>\n");
+    printer.Print("#include <utility>\n");
     printer.Print("#include <vector>\n\n");
 
     printer.Print("#include \"$base$.pb.h\"\n\n", "base", baseName);
@@ -354,6 +339,13 @@ bool FaabricGenerator::Generate(const FileDescriptor* file,
         printer.Print("class $name$ final {\n", "name", service->name());
         printer.Print("public:\n");
         printer.Indent();
+
+        std::map<std::string, std::string> vars;
+        vars["service_uri"] = getServiceUri(service);
+
+        printer.Print(vars,
+                      "static constexpr std::string_view ServiceUri = "
+                      "\"$service_uri$\";\n\n");
 
         GenerateClientStub(service, printer);
         GenerateServerService(service, printer);
