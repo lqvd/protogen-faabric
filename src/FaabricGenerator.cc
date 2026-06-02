@@ -89,13 +89,13 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
             "    faabric::rpc::ClientContext* ctx,\n"
             "    const $req_type$& req) {\n");
         printer.Indent();
-        printer.Print(vars, "co_return co_await $method_name$Async(ctx, req);\n");
+        printer.Print(vars, "co_return co_await Async$method_name$(ctx, req);\n");
         printer.Outdent();
         printer.Print("}\n\n");
 
         printer.Print(
             vars,
-            "faabric::rpc::RpcCall<$res_type$> $method_name$Async(\n"
+            "faabric::rpc::RpcCall<$res_type$> Async$method_name$(\n"
             "    faabric::rpc::ClientContext* ctx,\n"
             "    const $req_type$& req) {\n");
         printer.Indent();
@@ -106,7 +106,7 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
             "  return faabric::rpc::RpcCall<$res_type$>::Failed(\n"
             "      faabric::rpc::Status{\n"
             "          Rpc_StatusCode::INVALID_ARGUMENT,\n"
-            "          \"Null ClientContext passed to $method_name$Async\"});\n"
+            "          \"Null ClientContext passed to Async$method_name$\"});\n"
             "}\n\n"
             "std::vector<uint8_t> reqBuf(req.ByteSizeLong());\n"
             "if (!req.SerializeToArray(reqBuf.data(),\n"
