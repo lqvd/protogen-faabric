@@ -89,7 +89,12 @@ void GenerateClientStub(const ServiceDescriptor* service, io::Printer& printer)
             "    faabric::rpc::ClientContext* ctx,\n"
             "    const $req_type$& req) {\n");
         printer.Indent();
-        printer.Print(vars, "co_return co_await Async$method_name$(ctx, req);\n");
+        printer.Print(
+            vars,
+            "auto call = Async$method_name$(ctx, req);\n"
+            "auto result = co_await call;\n"
+            "co_return result;\n");
+
         printer.Outdent();
         printer.Print("}\n\n");
 
@@ -244,7 +249,8 @@ void GenerateServerService(const ServiceDescriptor* service, io::Printer& printe
             "  }\n\n"
             "  $res_type$ res;\n"
             "  faabric::rpc::ServerContext ctx;\n"
-            "  faabric::rpc::Status status = co_await $method_name$(&ctx, &req, &res);\n"
+            "  auto methodTask = $method_name$(&ctx, &req, &res);\n"
+            "  faabric::rpc::Status status = co_await methodTask;\n"
             "  if (!status.ok()) {\n"
             "    co_return status;\n"
             "  }\n\n"
